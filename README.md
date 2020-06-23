@@ -1,6 +1,6 @@
 # Batch Time Series Forecasting using R and Prophet
 
-TL;DR : Given a set of timeseries as input, this R script groups timeseries based on shared features and generates forecasts using Facebook's Prophet forecasting package.
+TL;DR : Given a set of time series as input, this R script groups timeseries based on shared features and generates forecasts using Facebook's Prophet forecasting package.
 
 ### Processing Steps
 
