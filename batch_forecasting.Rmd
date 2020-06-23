@@ -1,0 +1,301 @@
+---
+title: "2018 Service Forecasts"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+```{r message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(devtools)
+library(here)
+library(stringr)
+library(prophet)
+library(dplyr)
+library(anomalize)
+library(lubridate)
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE, results='hide'}
+#import flat file
+file_raw = here::here('data/example-aws-cost-hr-data.csv')
+data.raw = read_csv(file_raw)
+#disable scientific notation
+options(scipen=999)
+```
+
+```{r}
+#preprocess data
+data.clean = dplyr::tbl_df(data.raw) %>%
+  #change to numeric
+  mutate_at(.,vars(-app),funs(as.numeric)) %>%
+  #change na to 0 because timeseries
+  replace(is.na(.), 0) %>%
+  #don't need the total column %>%
+  filter(.,app!='app Total') %>%
+  #rename app to date
+  rename(.,date=app) %>%
+  #change date to date data type
+  mutate(date = ymd(date))
+```
+
+```{r}
+#make usage data tidy (variables in columns)
+data.usage = data.clean %>% 
+  select(.,-(`No Tagkey: app0($)`:`total cost`)) %>%
+  #rename remove other columns
+  rename_all(
+    funs(
+      #all lower
+      stringr::str_to_lower(.) %>%
+        #parse app name
+        stringr::str_replace_all(., "\\(.*\\)", '')
+    )
+  ) %>%
+  gather(.,instance,usage_hr,-date) 
+```
+
+```{r}
+#make cost data tidy (variables in columns)
+data.cost = data.clean %>% 
+  select(.,-(`No Tagkey: app0(hr)`:`total usage`)) %>%
+  #rename remove other columns
+  rename_all(
+    funs(
+      #all lower
+      stringr::str_to_lower(.) %>%
+        #parse app name
+        stringr::str_replace_all(., "\\(.*\\)", '')
+    )
+  ) %>%
+  gather(.,instance,cost_usd,-date) 
+```
+
+```{r}
+#join usage and cost together
+data.join = inner_join(data.cost,data.usage, by=c('date','instance')) %>%
+  #calc min instance count assuming 24 hour operation
+  mutate(min_instance_count= ceiling(usage_hr/24))
+
+head(data.join)
+```
+
+```{r}
+#tag first date cost is incurred for each instance  
+min.cost.date = data.join %>%
+  #remove zero cost days
+  filter(.,cost_usd > 0) %>%
+  group_by(instance) %>%
+  #get first cost date
+  summarize(min_date = min(date))
+```
+
+```{r}
+#remove dates before first cost date
+data.join.filter = left_join(data.join,min.cost.date, by = "instance") %>%
+  filter(.,date>=min_date) %>%
+  select(.,-min_date) %>%
+  #add count of days history
+  add_count(instance) %>%
+  rename(.,days_history = n) %>%
+  mutate(.,hist_group = ifelse(days_history<60,'short','long'))
+```
+
+```{r}
+#12
+data.join.filter %>% head()
+```
+
+```{r}
+#12
+data.join.filter %>% 
+  #filter(.,instance == 'no tagkey: app0') %>% 
+  #head() %>%
+  ggplot(.,aes(date,cost_usd, colour = instance)) + geom_line()
+
+```
+
+```{r}
+#create groups to forecast in to minimize short history
+forecast.group = data.join.filter %>%
+  group_by(instance,hist_group) %>%
+  #get cost information for that 30 days
+  top_n(.,30,date) %>%
+  #avg cost for last 30 days, total cost for last 30 days
+  summarize(.,avg_cost_per_day = mean(cost_usd),cost = sum(cost_usd)) %>%
+  mutate(.,cost_group = ifelse(avg_cost_per_day <= 1,'low','high')) %>%
+  mutate(.,forecast_group = case_when(
+    #these instances aren't generating costs
+    cost==0 ~ 'inactive',
+    #high cost and long history. Good candidate for individual forecast
+    cost_group=='high' && hist_group=='long' ~ instance,
+    #high cost and short history. Good candidate for grouping
+    cost_group=='high' && hist_group=='short' ~ "high$_shortTS",
+    #bucket everything else
+    TRUE ~ "low$orshort"
+  ))
+
+head(forecast.group)
+```
+
+```{r}
+#add forecasting groups to main data
+data.join.filter = left_join(
+                         data.join.filter
+                        ,forecast.group %>% select(.,instance,forecast_group,cost_group)
+                        ,by="instance"
+                        ) %>%
+  #remove deactived instances
+  filter(.,forecast_group!='inactive')
+```
+
+```{r}
+#Create aggregate All bucket that captures all active instance activity
+data.aggregate = data.join.filter %>%
+  group_by(date) %>%
+  summarise(
+    instance = 'All',
+    cost_usd = sum(cost_usd),
+    usage_hr = sum(usage_hr),
+    min_instance_count = sum(min_instance_count),
+    days_history = max(days_history),
+    hist_group = 'long',
+    forecast_group = 'All',
+    cost_group = 'high'
+  ) 
+
+head(data.aggregate)
+```
+
+```{r}
+#combine All and individual forecast groups
+data.combine = dplyr::union(data.join.filter,data.aggregate)
+```
+
+```{r, include=FALSE}
+#clean up 
+rm(data.join.filter)
+rm(data.aggregate)
+rm(data.cost)
+rm(data.usage)
+rm(data.raw)
+rm(data.clean)
+rm(data.join)
+rm(min.cost.date)
+```
+
+```{r}
+data.combine.group = data.combine %>%
+  group_by(forecast_group,date) %>%
+  summarise(
+    cost_usd = sum(cost_usd)
+  ) %>%
+  #rename columns for prophet use
+  rename(.,ds=date,y = cost_usd) %>%
+  arrange(forecast_group,ds)
+```
+
+```{r}
+#automatically remove outliers using anomalize
+data.no.outlier = data.combine.group %>%
+  filter(.,forecast_group!='inactive') %>%
+  group_by(forecast_group) %>%
+  #decompose time series
+  time_decompose(y,merge = TRUE) %>%
+  #tag anomalies/outliers
+  anomalize(remainder, max_anoms = 0.20) %>%
+  #set anomalies/outliers to NA
+  mutate(.,y=ifelse(anomaly=='Yes',NA,y)) %>%
+  select(.,ds,forecast_group,y)
+```
+
+```{r}
+#Outlier Detection And Removal Example
+data.combine.group %>%
+    filter(.,forecast_group=="All") %>%
+    group_by(forecast_group) %>%
+    time_decompose(y) %>%
+    anomalize(remainder) %>%
+    time_recompose() %>%
+    plot_anomalies(time_recomposed = TRUE, ncol = 3, alpha_dots = 0.5)
+
+```
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+#create summary df to store forecast model objects
+models.summary = data.no.outlier %>%
+  group_by(forecast_group) %>%
+  #nest timeseries into list data
+  nest() %>%
+  #create model m using linear growth
+  mutate(m=map(data,~prophet(.x,growth="linear"))) %>%
+  #create place holder for forecast predictions
+  mutate(future=map(m,~make_future_dataframe(.x, periods = 153, include_history = TRUE))) %>% 
+  #generate forecasts
+  mutate(forecast=map2(m,future,predict)) %>%
+  #add graphs
+  mutate(plot=pmap(list(m, forecast, forecast_group), ~plot(..1,..2,plot_cap=FALSE,ylabel='Cost_USD',xlabel='Date') + ggtitle(..3))) %>%
+  #add forecast_method
+  mutate(.,forecast_method = if_else(forecast_group=='All','Aggregate','Detailed'))
+```
+
+```{r}
+#Models View Sample
+#show forecast groups
+models.summary %>% 
+  select(.,forecast_method,forecast_group,everything()) %>%
+  head()
+```
+
+##Aggregate Level Forecast Cost_$
+###Activity for all items combined then forecasted together.
+```{r message=FALSE, warning=FALSE}
+#Aggregate Forecast
+aggregate.forecast = models.summary %>%
+  filter(.,forecast_method == 'Aggregate')
+
+#plot of aggregate level forecast
+aggregate.forecast$plot
+
+#monthly aggregate level forecast
+aggregate.forecast %>% 
+  select(.,forecast) %>%
+  unnest() %>%
+  select(.,ds,yhat,yhat_lower,yhat_upper) %>%
+  mutate(.,ds_month = floor_date(ds,"month")) %>%
+  group_by(ds_month) %>%
+  select(-ds) %>%
+  summarize(
+    yhat = sum(yhat),
+    yhat_lower = sum(yhat_lower),
+    yhat_upper = sum(yhat_upper)
+  ) %>%
+  filter(.,ds_month>=date("2018-08-01"))
+```
+
+##Detailed Level Forecast Cost_$
+###Groups forecasted individually then aggregated. Bottom Up Method.
+```{r message=FALSE, warning=FALSE}
+#Aggregate Forecast
+detailed.forecast = models.summary %>%
+  filter(.,forecast_method == 'Detailed')
+
+#individual forecasts aggregated to to monthly level
+detailed.forecast %>% 
+  select(.,forecast) %>%
+  unnest() %>%
+  select(.,ds,yhat,yhat_lower,yhat_upper) %>%
+  mutate(.,ds_month = floor_date(ds,"month")) %>%
+  group_by(ds_month) %>%
+  select(-ds) %>%
+  summarize(
+    yhat = sum(yhat),
+    yhat_lower = sum(yhat_lower),
+    yhat_upper = sum(yhat_upper)
+  ) %>%
+  filter(.,ds_month>=date("2018-08-01"))
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE, results='hide'}
+#plot of detailed level forecasts
+detailed.forecast$plot
+```
