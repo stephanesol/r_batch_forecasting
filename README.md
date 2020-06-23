@@ -9,7 +9,7 @@ last 30 days.
 * Create features for each timeseries:
   * length of available time series data (short vs long)
   * avg daily cost for last 30 days (low vs high)
-* Group service data based on feature groupings:
+* Group timeseries data based on feature groupings:
   * high costs and long time series are forecasted individually.
   * high costs and short time series are forecasted together to improve accuracy.
   * low costs or short time series are forecasted together to improve accuracy.
